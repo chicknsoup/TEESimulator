@@ -94,10 +94,11 @@ object ConfigurationManager {
         val customPkgKeybox = packages.firstNotNullOfOrNull { pkg -> packageKeyboxes[pkg] }
         if (customPkgKeybox != null) return customPkgKeybox
 
-        // If it falls under @all_user_apps and is NOT excluded
+        // If it falls under @all_user_apps and is NOT excluded/system app
         if (uid >= 10000 && allUserAppsMode != null) {
+            val hasSystemApp = packages.any { pkg -> isSystemPackage(pkg) }
             val isExcluded = packages.any { pkg -> excludedPackages.contains(pkg) }
-            if (!isExcluded) {
+            if (!hasSystemApp && !isExcluded) {
                 return allUserAppsKeybox
             }
         }
@@ -132,11 +133,17 @@ object ConfigurationManager {
             }
         }
 
-        // 2. Fallback to @all_user_apps rule if UID is a user app (uid >= 10000)
+        // 2. Fallback to @all_user_apps rule if UID belongs to a user app space (uid >= 10000)
         if (uid >= 10000) {
-            // Check if any package in this UID is excluded via prefix '~'
+            // Check if any package in this UID is a system application (built-in or updated)
+            val hasSystemApp = packages.any { pkg -> isSystemPackage(pkg) }
+            // Check if any package in this UID is explicitly excluded via prefix '~'
             val isExcluded = packages.any { pkg -> excludedPackages.contains(pkg) }
             
+            if (hasSystemApp) {
+                return null // real TEE will handle it
+            }
+
             if (!isExcluded) {
                 when (allUserAppsMode) {
                     Mode.GENERATE -> return Mode.GENERATE
@@ -145,11 +152,34 @@ object ConfigurationManager {
                     null -> { /* Do nothing, continue to return null */ }
                 }
             } else {
-                SystemLogger.info("UID $uid matches @all_user_apps but is excluded by list.")
+                SystemLogger.info("UID $uid matches @all_user_apps but is excluded by list (~).")
             }
         }
 
         return null // No configuration found for this UID.
+    }
+
+    /**
+     * Helper function to detect if a package is a system application using Android Framework bitwise flags.
+     * Works perfectly even if the system application has been updated by the user from Google Play Store.
+     */
+    private fun isSystemPackage(packageName: String): Boolean {
+        return try {
+            val pm = getPackageManager() ?: return false
+            val packageInfo = pm.getPackageInfo(packageName, 0, 0) ?: return false
+            val appInfo = packageInfo.applicationInfo ?: return false
+            val flagSystem = 1
+            val flagUpdatedSystemApp = 128
+            val flagsValue = when (val flagsObj = appInfo.flags) {
+                is Number -> flagsObj.toInt()
+                else -> flagsObj.toString().toIntOrNull() ?: 0
+            }
+            val isSys = (flagsValue and flagSystem) != 0
+            val isUpdatedSys = (flagsValue and flagUpdatedSystemApp) != 0
+            isSys || isUpdatedSys
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
