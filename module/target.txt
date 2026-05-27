@@ -1,11 +1,13 @@
+# Scope all apps by default
+@all_user_apps
+
+# White list
+~com.google.android.as
+~com.samsung.android.spay
+~com.samsung.android.samsungpass
+~com.netflix.mediaclient
+~com.google.android.apps.walletnfcrel
+
+# Black list
 com.android.vending
 com.google.android.gms
-io.github.vvb2060.keyattestation
-io.github.vvb2060.mahoshojo
-icu.nullptr.nativetest
-com.reveny.nativecheck
-com.zhenxi.hunter
-io.github.qwq233.keyattestation
-com.android.nativetest
-io.liankong.riskdetector
-luna.safe.luna

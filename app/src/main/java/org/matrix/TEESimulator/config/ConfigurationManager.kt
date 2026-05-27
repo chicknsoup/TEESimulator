@@ -43,6 +43,11 @@ object ConfigurationManager {
     @Volatile private var globalCustomPatchLevel: CustomPatchLevel? = null
     @Volatile private var packagePatchLevels = mapOf<String, CustomPatchLevel>()
 
+    // --- Global User Apps Override State ---
+    @Volatile private var allUserAppsMode: Mode? = null
+    @Volatile private var allUserAppsKeybox: String = DEFAULT_KEYBOX_FILE
+    @Volatile private var excludedPackages = setOf<String>()
+
     // Cache for UID to package name resolution.
     private val uidToPackagesCache = ConcurrentHashMap<Int, Array<String>>()
 
@@ -84,7 +89,20 @@ object ConfigurationManager {
      */
     fun getKeyboxFileForUid(uid: Int): String {
         val packages = getPackagesForUid(uid)
-        return packages.firstNotNullOfOrNull { pkg -> packageKeyboxes[pkg] } ?: DEFAULT_KEYBOX_FILE
+        
+        // If it matches a package-specific keybox, return it first
+        val customPkgKeybox = packages.firstNotNullOfOrNull { pkg -> packageKeyboxes[pkg] }
+        if (customPkgKeybox != null) return customPkgKeybox
+
+        // If it falls under @all_user_apps and is NOT excluded
+        if (uid >= 10000 && allUserAppsMode != null) {
+            val isExcluded = packages.any { pkg -> excludedPackages.contains(pkg) }
+            if (!isExcluded) {
+                return allUserAppsKeybox
+            }
+        }
+
+        return DEFAULT_KEYBOX_FILE
     }
 
     /** Determines if the certificate for a given UID needs to be patched. */
@@ -104,15 +122,33 @@ object ConfigurationManager {
         // Lazily load TEE status if it hasn't been checked yet.
         if (isTeeBroken == null) loadTeeStatus()
 
-        // Find the first configured mode for any of the UID's packages.
+        // 1. Check package-specific configurations first (explicit config overrides global rule)
         for (pkg in packages) {
             when (packageModes[pkg]) {
                 Mode.GENERATE -> return Mode.GENERATE
                 Mode.PATCH -> return Mode.PATCH
                 Mode.AUTO -> return if (isTeeBroken == true) Mode.GENERATE else Mode.PATCH
-                null -> continue // No config for this package, check the next one.
+                null -> continue
             }
         }
+
+        // 2. Fallback to @all_user_apps rule if UID is a user app (uid >= 10000)
+        if (uid >= 10000) {
+            // Check if any package in this UID is excluded via prefix '~'
+            val isExcluded = packages.any { pkg -> excludedPackages.contains(pkg) }
+            
+            if (!isExcluded) {
+                when (allUserAppsMode) {
+                    Mode.GENERATE -> return Mode.GENERATE
+                    Mode.PATCH -> return Mode.PATCH
+                    Mode.AUTO -> return if (isTeeBroken == true) Mode.GENERATE else Mode.PATCH
+                    null -> { /* Do nothing, continue to return null */ }
+                }
+            } else {
+                SystemLogger.info("UID $uid matches @all_user_apps but is excluded by list.")
+            }
+        }
+
         return null // No configuration found for this UID.
     }
 
@@ -143,8 +179,12 @@ object ConfigurationManager {
 
         val newModes = mutableMapOf<String, Mode>()
         val newKeyboxes = mutableMapOf<String, String>()
+        val newExcludedPackages = mutableSetOf<String>()
         var currentKeybox = DEFAULT_KEYBOX_FILE
         val keyboxRegex = Regex("^\\[([a-zA-Z0-9_.-]+\\.xml)]$")
+
+        var newAllUserAppsMode: Mode? = null
+        var newAllUserAppsKeybox = DEFAULT_KEYBOX_FILE
 
         try {
             file.readLines().forEach { line ->
@@ -159,6 +199,34 @@ object ConfigurationManager {
                 }
 
                 when {
+                    // Match exclusion rule prefix '~'
+                    trimmedLine.startsWith("~") -> {
+                        val pkg = trimmedLine.removePrefix("~").trim()
+                        if (pkg.isNotEmpty()) {
+                            newExcludedPackages.add(pkg)
+                            SystemLogger.info("Excluding package from @all_user_apps: $pkg")
+                        }
+                    }
+                    // Match @all_user_apps with suffixes
+                    trimmedLine.startsWith("@all_user_apps") -> {
+                        when {
+                            trimmedLine.endsWith("!") -> {
+                                newAllUserAppsMode = Mode.GENERATE
+                                newAllUserAppsKeybox = currentKeybox
+                                SystemLogger.info("Global target: @all_user_apps set to GENERATE mode.")
+                            }
+                            trimmedLine.endsWith("?") -> {
+                                newAllUserAppsMode = Mode.PATCH
+                                newAllUserAppsKeybox = currentKeybox
+                                SystemLogger.info("Global target: @all_user_apps set to PATCH mode.")
+                            }
+                            else -> {
+                                newAllUserAppsMode = Mode.AUTO
+                                newAllUserAppsKeybox = currentKeybox
+                                SystemLogger.info("Global target: @all_user_apps set to AUTO mode.")
+                            }
+                        }
+                    }
                     // Suffix '!' means force GENERATE mode.
                     trimmedLine.endsWith("!") -> {
                         val pkg = trimmedLine.removeSuffix("!").trim()
@@ -182,8 +250,12 @@ object ConfigurationManager {
             // Atomically update the configuration maps.
             packageModes = newModes
             packageKeyboxes = newKeyboxes
+            allUserAppsMode = newAllUserAppsMode
+            allUserAppsKeybox = newAllUserAppsKeybox
+            excludedPackages = newExcludedPackages
+            
             uidToPackagesCache.clear() // Invalidate cache as package settings have changed.
-            SystemLogger.info("Successfully loaded ${newModes.size} package configurations.")
+            SystemLogger.info("Successfully loaded ${newModes.size} package configurations. Excluded ${newExcludedPackages.size} packages.")
         } catch (e: Exception) {
             SystemLogger.error("Failed to load or parse ${file.name}", e)
         }
