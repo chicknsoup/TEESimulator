@@ -373,10 +373,7 @@ class KeyMintSecurityLevelInterceptor(
             // Iterate through all entries in the map to check both the key (for UID) and value (for
             // nspace).
             if (nspace == null || nspace == 0L) return null
-            return generatedKeys.entries
-                .filter { (keyIdentifier, _) -> keyIdentifier.uid == callingUid }
-                .find { (_, info) -> info.nspace == nspace }
-                ?.value
+            return generatedKeys.values.find { it.nspace == nspace }
         }
 
         fun getPatchedChain(keyId: KeyIdentifier): Array<Certificate>? = patchedChains[keyId]

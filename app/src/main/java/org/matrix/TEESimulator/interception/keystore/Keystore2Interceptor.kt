@@ -5,9 +5,11 @@ import android.hardware.security.keymint.SecurityLevel
 import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
+import android.system.keystore2.Domain
 import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
+import java.util.concurrent.ConcurrentHashMap
 import java.security.SecureRandom
 import java.security.cert.Certificate
 import org.matrix.TEESimulator.attestation.AttestationPatcher
@@ -43,6 +45,20 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         if (Build.VERSION.SDK_INT >= 34)
             InterceptorUtils.getTransactCode(stubBinderClass, "listEntriesBatched")
         else null
+    private val GRANT_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubBinderClass, "grant")
+    private val UNGRANT_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubBinderClass, "ungrant")
+
+    // Map from grant ID (nspace) to owner's KeyIdentifier
+    private val grantIdToKeyIdentifier = ConcurrentHashMap<Long, KeyIdentifier>()
+
+    // Map to track transaction start times for timing measurements
+    private val transactionStartTimes = ConcurrentHashMap<Long, Long>()
+
+    // Dynamic sliding average of hardware getKeyEntry latency (default 1.2ms)
+    @Volatile private var averageHardwareLatencyNs = 1_200_000L
+    private val EMA_ALPHA = 0.1
 
     private val transactionNames: Map<Int, String> by lazy {
         stubBinderClass.declaredFields
@@ -110,6 +126,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             } else {
                 return TransactionResult.Continue
             }
+        } else if (code == GRANT_TRANSACTION || code == UNGRANT_TRANSACTION) {
+            logTransaction(txId, transactionNames[code] ?: "grant/ungrant", callingUid, callingPid)
+
+            if (ConfigurationManager.shouldSkipUid(callingUid))
+                return TransactionResult.ContinueAndSkipPost
+
+            return TransactionResult.Continue
         } else if (
             code == GET_KEY_ENTRY_TRANSACTION ||
                 code == DELETE_KEY_TRANSACTION ||
@@ -128,39 +151,57 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.ContinueAndSkipPost
 
-            if (descriptor.alias != null) {
-                SystemLogger.info("Handling ${transactionNames[code]!!} ${descriptor.alias}")
-            } else {
+            val isGrantKey = descriptor.domain == Domain.GRANT
+            if (descriptor.alias == null && !isGrantKey) {
                 SystemLogger.info(
                     "Skip ${transactionNames[code]!!} for key [alias, blob, domain, nspace]: [${descriptor.alias}, ${descriptor.blob}, ${descriptor.domain}, ${descriptor.nspace}]"
                 )
                 return TransactionResult.ContinueAndSkipPost
             }
-            val keyId = KeyIdentifier(callingUid, descriptor.alias)
+
+            val keyId = if (isGrantKey) {
+                grantIdToKeyIdentifier[descriptor.nspace]
+            } else {
+                KeyIdentifier(callingUid, descriptor.alias)
+            }
 
             if (code == DELETE_KEY_TRANSACTION) {
-                if (KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId) != null) {
+                if (keyId != null && KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId) != null) {
                     KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
                     SystemLogger.info(
-                        "[TX_ID: $txId] Deleted cached keypair ${descriptor.alias}, replying with empty response."
+                        "[TX_ID: $txId] Deleted cached keypair ${descriptor.alias ?: ("grant:" + descriptor.nspace)}, replying with empty response."
                     )
                     return InterceptorUtils.createSuccessReply(writeResultCode = false)
                 }
                 return TransactionResult.ContinueAndSkipPost
             }
 
-            val response =
+            val txStartTime = System.nanoTime()
+            val response = if (keyId != null) {
                 KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(keyId)
-                    ?: return TransactionResult.Continue
+            } else null
 
-            if (KeyMintSecurityLevelInterceptor.isAttestationKey(keyId))
-                SystemLogger.info("${descriptor.alias} was an attestation key")
+            if (response != null) {
+                if (KeyMintSecurityLevelInterceptor.isAttestationKey(keyId!!))
+                    SystemLogger.info("${descriptor.alias ?: ("grant:" + descriptor.nspace)} was an attestation key")
 
-            SystemLogger.info("[TX_ID: $txId] Found generated response for ${descriptor.alias}:")
-            response.metadata?.authorizations?.forEach {
-                KeyMintParameterLogger.logParameter(it.keyParameter)
+                SystemLogger.info("[TX_ID: $txId] Found generated response for ${descriptor.alias ?: ("grant:" + descriptor.nspace)}:")
+                response.metadata?.authorizations?.forEach {
+                    KeyMintParameterLogger.logParameter(it.keyParameter)
+                }
+
+                val elapsedNs = System.nanoTime() - txStartTime
+                val sleepNs = averageHardwareLatencyNs - elapsedNs
+                if (sleepNs > 0) {
+                    runCatching {
+                        Thread.sleep(sleepNs / 1_000_000, (sleepNs % 1_000_000).toInt())
+                    }
+                }
+                return InterceptorUtils.createTypedObjectReply(response)
             }
-            return InterceptorUtils.createTypedObjectReply(response)
+
+            transactionStartTimes[txId] = txStartTime
+            return TransactionResult.Continue
         } else {
             logTransaction(
                 txId,
@@ -209,21 +250,34 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     TransactionResult.SkipTransaction
                 }
         } else if (code == GET_KEY_ENTRY_TRANSACTION) {
+            val startNs = transactionStartTimes.remove(txId)
+            if (startNs != null) {
+                val durationNs = System.nanoTime() - startNs
+                if (durationNs in 100_000L..10_000_000L) {
+                    averageHardwareLatencyNs = (averageHardwareLatencyNs * (1 - EMA_ALPHA) + durationNs * EMA_ALPHA).toLong()
+                }
+            }
+
             data.enforceInterface(IKeystoreService.DESCRIPTOR)
             val keyDescriptor =
                 data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.SkipTransaction
 
+            val isGrantKey = keyDescriptor.domain == Domain.GRANT
             logTransaction(
                 txId,
-                "post-${transactionNames[code]!!} ${keyDescriptor.alias}",
+                "post-${transactionNames[code]!!} ${keyDescriptor.alias ?: ("grant:" + keyDescriptor.nspace)}",
                 callingUid,
                 callingPid,
             )
 
             runCatching {
                     val response = reply.readTypedObject(KeyEntryResponse.CREATOR)!!
-                    val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+                    val keyId = if (isGrantKey) {
+                        grantIdToKeyIdentifier[keyDescriptor.nspace] ?: KeyIdentifier(callingUid, "grant_${keyDescriptor.nspace}")
+                    } else {
+                        KeyIdentifier(callingUid, keyDescriptor.alias)
+                    }
 
                     val authorizations = response.metadata.authorizations
                     val parsedParameters =
@@ -236,22 +290,24 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return TransactionResult.SkipTransaction
                     }
 
+                    val aliasOrFallback = keyId.alias ?: "grant_${keyDescriptor.nspace}"
+
                     if (parsedParameters.isAttestKey()) {
                         SystemLogger.warning(
-                            "[TX_ID: $txId] Found hardware attest key ${keyId.alias} in the reply."
+                            "[TX_ID: $txId] Found hardware attest key $aliasOrFallback in the reply."
                         )
                         // Attest keys that are not under our control should be overriden.
                         val keyData =
                             CertificateGenerator.generateAttestedKeyPair(
-                                callingUid,
-                                keyId.alias,
+                                keyId.uid,
+                                aliasOrFallback,
                                 null,
                                 parsedParameters,
                                 response.metadata.keySecurityLevel,
                             ) ?: throw Exception("Failed to create overriding attest key pair.")
 
                         CertificateHelper.updateCertificateChain(
-                                callingUid,
+                                keyId.uid,
                                 response.metadata,
                                 keyData.second.toTypedArray(),
                             )
@@ -296,14 +352,14 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                             "[TX_ID: $txId] No cached chain for $keyId. Performing live patch as a fallback."
                         )
                         finalChain =
-                            AttestationPatcher.patchCertificateChain(originalChain, callingUid)
+                            AttestationPatcher.patchCertificateChain(originalChain, keyId.uid)
 
                         KeyMintSecurityLevelInterceptor.patchedChains[keyId] = finalChain
                         SystemLogger.debug("Cached patched certificate chain for $keyId.")
                     }
 
                     CertificateHelper.updateCertificateChain(
-                            callingUid,
+                            keyId.uid,
                             response.metadata,
                             finalChain,
                         )
@@ -318,6 +374,35 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     )
                     return TransactionResult.SkipTransaction
                 }
+        } else if (code == GRANT_TRANSACTION) {
+            logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
+            runCatching {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.SkipTransaction
+                val granteeUid = data.readInt()
+
+                val grantDescriptor = reply.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.SkipTransaction
+                val grantId = grantDescriptor.nspace
+
+                val ownerKeyId = KeyIdentifier(callingUid, descriptor.alias)
+                grantIdToKeyIdentifier[grantId] = ownerKeyId
+                SystemLogger.info("[TX_ID: $txId] Mapped grantId $grantId to owner key $ownerKeyId for granteeUid $granteeUid")
+            }.onFailure {
+                SystemLogger.error("[TX_ID: $txId] Failed to map grant transaction.", it)
+            }
+            return TransactionResult.SkipTransaction
+        } else if (code == UNGRANT_TRANSACTION) {
+            logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
+            runCatching {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.SkipTransaction
+                val ownerKeyId = KeyIdentifier(callingUid, descriptor.alias)
+                grantIdToKeyIdentifier.values.removeIf { it == ownerKeyId }
+                SystemLogger.info("[TX_ID: $txId] Removed grant mapping for owner key $ownerKeyId")
+            }.onFailure {
+                SystemLogger.error("[TX_ID: $txId] Failed to handle ungrant transaction.", it)
+            }
+            return TransactionResult.SkipTransaction
         }
         return TransactionResult.SkipTransaction
     }
